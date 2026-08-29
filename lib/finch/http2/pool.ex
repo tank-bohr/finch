@@ -193,6 +193,22 @@ defmodule Finch.HTTP2.Pool do
 
   def ping(pool), do: :gen_statem.call(pool, :ping)
 
+  @doc false
+  # Hands an established connection over to the pool, see Finch.ALPN.Factory
+  def seed(pool, conn) do
+    case HTTP2.controlling_process(conn, pool) do
+      {:ok, conn} ->
+        :gen_statem.call(pool, {:seed, conn})
+
+      {:error, _error} ->
+        HTTP2.close(conn)
+    end
+
+    :ok
+  catch
+    :exit, _reason -> :ok
+  end
+
   def start_link({_pool, _pool_name, _registry, _pool_config, _pool_idx} = opts) do
     :gen_statem.start_link(__MODULE__, opts, [])
   end
@@ -227,7 +243,16 @@ defmodule Finch.HTTP2.Pool do
       draining: false
     }
 
-    {:ok, :disconnected, data, {:next_event, :internal, {:connect, 0}}}
+    # Shards of an ALPN pool ask for the connection the protocol was negotiated
+    # on before connecting themselves, see Finch.ALPN.Factory. If it does not
+    # arrive in time, we connect anyway.
+    action =
+      case Finch.ALPN.Factory.request_seed(registry, pool, pool_idx) do
+        :ok -> {{:timeout, :reconnect}, data.backoff_base, 0}
+        :none -> {:next_event, :internal, {:connect, 0}}
+      end
+
+    {:ok, :disconnected, data, action}
   end
 
   @doc false
@@ -329,6 +354,29 @@ defmodule Finch.HTTP2.Pool do
     {:keep_state_and_data, {:reply, from, {:error, Error.exception(:disconnected)}}}
   end
 
+  # Take over a connection established by the caller, see seed/2. The
+  # connection was opened in passive mode so no data has been received yet.
+  def disconnected({:call, from}, {:seed, conn}, data) do
+    case HTTP2.set_mode(conn, :active) do
+      {:ok, conn} ->
+        data = %{data | conn: conn}
+        next = if data.wait_for_server_settings?, do: :connecting, else: :connected
+
+        # Reply once connected, after the state enter call, so the pool is
+        # registered by then
+        actions = [
+          {:next_event, :internal, {:seeded, from}},
+          {{:timeout, :reconnect}, :cancel}
+        ]
+
+        {:next_state, next, data, actions}
+
+      {:error, _error} ->
+        HTTP2.close(conn)
+        {:keep_state_and_data, {:reply, from, :error}}
+    end
+  end
+
   # Immediately fail a request if we're disconnected
   def disconnected(:cast, {:async_request, pid, request_ref, _, _}, _data) do
     send(pid, {request_ref, {:error, Error.exception(:disconnected)}})
@@ -353,11 +401,16 @@ defmodule Finch.HTTP2.Pool do
     :keep_state_and_data
   end
 
+  # The ALPN pool has no connection for us, connect ourselves (see init/1)
   # Its possible that we can receive an info message telling us that a socket
   # has been closed. This happens after we enter a disconnected state from a
   # read_only state but we don't have any requests that are open. We've already
   # closed the connection and thrown it away at this point so we can just retain
   # our current state.
+  def disconnected(:internal, {:seeded, from}, _data) do
+    {:keep_state_and_data, {:reply, from, :error}}
+  end
+
   def disconnected(:info, _message, _data) do
     :keep_state_and_data
   end
@@ -376,6 +429,10 @@ defmodule Finch.HTTP2.Pool do
 
   def connecting({:call, from}, :ping, _data),
     do: {:keep_state_and_data, {:reply, from, {:error, Error.exception(:connection_not_ready)}}}
+
+  def connecting({:call, from}, {:seed, conn}, _data), do: reject_seed(from, conn)
+
+  def connecting(:internal, {:seeded, _from}, _data), do: {:keep_state_and_data, :postpone}
 
   def connecting({:timeout, _}, _content, _data), do: :keep_state_and_data
 
@@ -431,6 +488,11 @@ defmodule Finch.HTTP2.Pool do
     data = cancel_request(data, request_ref)
     {:keep_state, data, {:reply, from, :ok}}
   end
+
+  def connected({:call, from}, {:seed, conn}, _data), do: reject_seed(from, conn)
+
+  def connected(:internal, {:seeded, from}, _data),
+    do: {:keep_state_and_data, {:reply, from, :ok}}
 
   def connected(:cast, {:async_request, pid, request_ref, req, opts}, data) do
     if is_nil(data.requests_by_pid[pid]) do
@@ -591,6 +653,8 @@ defmodule Finch.HTTP2.Pool do
     data = cancel_request(data, request_ref)
     {:keep_state, data, {:reply, from, :ok}}
   end
+
+  def connected_read_only({:call, from}, {:seed, conn}, _data), do: reject_seed(from, conn)
 
   def connected_read_only(:cast, {:async_request, pid, request_ref, _, _}, _) do
     send(pid, {request_ref, {:error, Error.exception(:read_only)}})
@@ -1028,6 +1092,12 @@ defmodule Finch.HTTP2.Pool do
 
   defp reply(%{from: from}, reply) do
     :gen_statem.reply(from, reply)
+  end
+
+  # We already have a connection, the seed is ours to close, see seed/2
+  defp reject_seed(from, conn) do
+    HTTP2.close(conn)
+    {:keep_state_and_data, {:reply, from, :error}}
   end
 
   @impl :gen_statem

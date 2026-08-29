@@ -10,11 +10,12 @@ defmodule Finch.ALPNServer do
       plug: Finch.ALPNServer.PlugRouter,
       options: [
         port: Keyword.fetch!(opts, :port),
+        ref: Keyword.get(opts, :ref, Finch.ALPNServer),
         cipher_suite: :strong,
         certfile: Path.join([@fixtures_dir, "selfsigned.pem"]),
         keyfile: Path.join([@fixtures_dir, "selfsigned_key.pem"]),
         # Enable ALPN negotiation between HTTP/2 and HTTP/1.1
-        alpn_preferred_protocols: ["h2", "http/1.1"],
+        alpn_preferred_protocols: Keyword.get(opts, :protocols, ["h2", "http/1.1"]),
         otp_app: :finch,
         protocol_options: [
           idle_timeout: 3_000,
@@ -27,8 +28,8 @@ defmodule Finch.ALPNServer do
     )
   end
 
-  def start(port) do
-    Supervisor.start_link([child_spec(port: port)], strategy: :one_for_one)
+  def start(port, opts \\ []) do
+    Supervisor.start_link([child_spec([port: port] ++ opts)], strategy: :one_for_one)
   end
 end
 

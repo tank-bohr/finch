@@ -147,6 +147,31 @@ defmodule Finch.HTTP1.Pool do
   @impl Finch.Pool.Manager
   defdelegate get_pool_status(finch_name, pool_name), to: PoolMetrics
 
+  @doc false
+  # Adds an established connection to the pool, see Finch.ALPN.Factory
+  def seed(pool, mint) do
+    case Mint.HTTP.controlling_process(mint, pool) do
+      {:ok, mint} ->
+        NimblePool.checkout!(pool, {:seed, mint}, fn
+          _from, {:seeded, conn} ->
+            {:ok, {:ok, conn}}
+
+          # The worker was already connected, keep its connection
+          _from, {:reuse, conn, _idle_time} ->
+            Mint.HTTP.close(mint)
+            {:ok, {:ok, conn}}
+        end)
+
+      {:error, _error} ->
+        Mint.HTTP.close(mint)
+        :ok
+    end
+  catch
+    :exit, _reason ->
+      Mint.HTTP.close(mint)
+      :ok
+  end
+
   @impl NimblePool
   def init_pool({pool, pool_name, registry, pool_config, pool_idx}) do
     {:ok, metric_ref} =
@@ -157,6 +182,10 @@ defmodule Finch.HTTP1.Pool do
     # Register our pool with our module name as the key. This allows the caller
     # to determine the correct pool module to use to make the request
     {:ok, _} = Registry.register(registry, pool_name, __MODULE__)
+
+    # Shards of an ALPN pool ask for the connection the protocol was negotiated
+    # on, see Finch.ALPN.Factory
+    Finch.ALPN.Factory.request_seed(registry, pool, pool_idx)
 
     acitivity_info =
       if pool_config.pool_max_idle_time != :infinity, do: init_activity_info(), else: nil
@@ -183,6 +212,17 @@ defmodule Finch.HTTP1.Pool do
     idle_time = System.monotonic_time() - conn.last_checkin
     PoolMetrics.maybe_add(pool_state.metric_ref, :in_use_connections, 1)
     {:ok, {:fresh, conn, idle_time}, conn, update_activity_info(:checkout, pool_state)}
+  end
+
+  # The seeded connection is checked back in right away, see seed/2
+  def handle_checkout({:seed, mint}, _, %{mint: nil} = conn, %__MODULE__.State{} = pool_state) do
+    PoolMetrics.maybe_add(pool_state.metric_ref, :in_use_connections, 1)
+    conn = %{conn | mint: mint}
+    {:ok, {:seeded, conn}, conn, update_activity_info(:checkout, pool_state)}
+  end
+
+  def handle_checkout({:seed, _mint}, from, conn, %__MODULE__.State{} = pool_state) do
+    handle_checkout(:checkout, from, conn, pool_state)
   end
 
   def handle_checkout(:checkout, _from, conn, %__MODULE__.State{} = pool_state) do

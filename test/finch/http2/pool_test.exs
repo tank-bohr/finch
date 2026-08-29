@@ -12,6 +12,9 @@ defmodule Finch.HTTP2.PoolTest do
 
   @moduletag :capture_log
 
+  @supervisor_registry Finch.Pool.Manager.supervisor_registry_name(:test)
+  @conn_opts [protocols: [:http1, :http2], mode: :passive, transport_opts: [verify: :verify_none]]
+
   setup do
     us = self()
 
@@ -19,6 +22,7 @@ defmodule Finch.HTTP2.PoolTest do
     Process.register(listener, __MODULE__)
 
     start_supervised({Registry, keys: :unique, name: :test, listeners: [__MODULE__]})
+    start_supervised({Registry, keys: :unique, name: @supervisor_registry})
 
     request = %{
       scheme: :https,
@@ -883,6 +887,132 @@ defmodule Finch.HTTP2.PoolTest do
       ])
 
       assert_receive {:resp, {:ok, {200, [], "hello"}}}
+    end
+  end
+
+  # The tests act as the factory of the shard, see Finch.ALPN.Factory
+  describe "seeding" do
+    # The test is the registry listener itself, so the reply of a pool to seed/2
+    # and its registration notice arrive in the order the pool sent them
+    setup do
+      forwarder = Process.whereis(__MODULE__)
+      Process.unregister(__MODULE__)
+      Process.register(self(), __MODULE__)
+      on_exit(fn -> Process.register(forwarder, __MODULE__) end)
+    end
+
+    # The factory hands its registry entry over to the pool once seed/2 returns,
+    # so the pool must be registered by then or requests find neither
+    test "replies to the seed once registered" do
+      {:ok, pool} =
+        start_server_and_connect_with([assert_registered: false], fn port ->
+          key = {Finch.ALPN.Factory, {:https, "localhost", port, :default}, 1}
+          {:ok, _} = Registry.register(@supervisor_registry, key, nil)
+          {:ok, pool} = start_pool(port)
+          assert_receive {:"$gen_cast", {:seed?, ^pool}}
+          {:ok, conn} = Mint.HTTP.connect(:https, "localhost", port, @conn_opts)
+          {:ok, conn} = Mint.HTTP.controlling_process(conn, pool)
+
+          # A plain call, so the reply stays in the mailbox in the order it arrived
+          ref = make_ref()
+          send(pool, {:"$gen_call", {self(), ref}, {:seed, conn}})
+
+          receive do
+            {:register, :test, :pool_name, ^pool, Pool} -> :ok
+            {^ref, :ok} -> flunk("the seed was accepted before the pool registered")
+          end
+
+          assert_receive {^ref, :ok}
+          {:ok, pool}
+        end)
+
+      assert [{^pool, Pool}] = Registry.lookup(:test, :pool_name)
+    end
+
+    test "uses the seeded connection instead of connecting", %{request: req} do
+      us = self()
+
+      {:ok, pool} =
+        start_server_and_connect_with(fn port ->
+          key = {Finch.ALPN.Factory, {:https, "localhost", port, :default}, 1}
+          {:ok, _} = Registry.register(@supervisor_registry, key, nil)
+          {:ok, pool} = start_pool(port)
+          assert_receive {:"$gen_cast", {:seed?, ^pool}}
+          {:ok, conn} = Mint.HTTP.connect(:https, "localhost", port, @conn_opts)
+          :ok = Pool.seed(pool, conn)
+          {:ok, pool}
+        end)
+
+      spawn(fn ->
+        result = request(pool, req, [])
+        send(us, {:resp, result})
+      end)
+
+      assert_recv_frames([headers(stream_id: stream_id)])
+
+      hbf = server_encode_headers([{":status", "200"}])
+
+      server_send_frames([
+        headers(stream_id: stream_id, hbf: hbf, flags: set_flags(:headers, [:end_headers])),
+        data(stream_id: stream_id, data: "hello", flags: set_flags(:data, [:end_stream]))
+      ])
+
+      assert_receive {:resp, {:ok, {200, [], "hello"}}}
+    end
+
+    test "connects by itself when the pool of the factory is started" do
+      {:ok, pool} =
+        start_server_and_connect_with(fn port ->
+          key = {Finch.ALPN.Factory, {:https, "localhost", port, :default}, 1}
+          {:ok, _} = Registry.register(@supervisor_registry, key, Finch.HTTP2.Pool)
+          start_pool(port)
+        end)
+
+      refute_receive {:"$gen_cast", {:seed?, ^pool}}
+      assert [{^pool, _}] = Registry.lookup(:test, :pool_name)
+    end
+
+    test "connects by itself when no seed arrives in time" do
+      {:ok, pool} =
+        start_server_and_connect_with(fn port ->
+          key = {Finch.ALPN.Factory, {:https, "localhost", port, :default}, 1}
+          {:ok, _} = Registry.register(@supervisor_registry, key, nil)
+          start_pool(port)
+        end)
+
+      assert_receive {:"$gen_cast", {:seed?, ^pool}}
+      assert [{^pool, _}] = Registry.lookup(:test, :pool_name)
+    end
+
+    test "closes the seed when already connected" do
+      us = self()
+
+      {:ok, pool} =
+        start_server_and_connect_with(fn port ->
+          send(us, {:port, port})
+          start_pool(port)
+        end)
+
+      assert_receive {:port, port}
+
+      # The server completes the HTTP/2 handshake once the client acks its settings
+      server = Process.get(@pdict_key)
+
+      accept =
+        Task.async(fn ->
+          server = MockHTTP2Server.accept_socket(server)
+          :ok = :ssl.controlling_process(MockHTTP2Server.get_socket(server), us)
+          server
+        end)
+
+      {:ok, conn} = Mint.HTTP.connect(:https, "localhost", port, @conn_opts)
+      {:ok, conn, _responses} = Mint.HTTP.recv(conn, 0, 1_000)
+      socket = MockHTTP2Server.get_socket(Task.await(accept))
+
+      :ok = Pool.seed(pool, conn)
+
+      assert_receive {:ssl_closed, ^socket}
+      assert [{^pool, _}] = Registry.lookup(:test, :pool_name)
     end
   end
 

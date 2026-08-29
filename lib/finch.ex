@@ -23,8 +23,9 @@ defmodule Finch do
 
       If using `:http1` only, an HTTP1 pool without multiplexing is used. \
       If using `:http2` only, an HTTP2 pool with multiplexing is used. \
-      If both are listed, then both HTTP1/HTTP2 connections are \
-      supported (via ALPN), but there is no multiplexing.
+      If both are listed, each shard of the pool negotiates the protocol with \
+      the server via ALPN on its first request and then uses the HTTP1 or the \
+      HTTP2 implementation accordingly. `http://` pools always use HTTP1.
       """,
       default: [:http1]
     ],
@@ -559,11 +560,12 @@ defmodule Finch do
       |> Keyword.put(:protocols, valid[:protocols])
       |> Keyword.put(:client_settings, client_settings)
 
+    # Mirrors the dispatch on :protocols in Mint.Negotiate.connect/4
     mod =
-      if :http1 in valid[:protocols] do
-        Finch.HTTP1.Pool
-      else
-        Finch.HTTP2.Pool
+      case Enum.sort(valid[:protocols]) do
+        [:http1] -> Finch.HTTP1.Pool
+        [:http2] -> Finch.HTTP2.Pool
+        [:http1, :http2] -> Finch.ALPN.Pool
       end
 
     %{

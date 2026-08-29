@@ -54,8 +54,9 @@ defmodule Finch.Pool.Supervisor do
     end
   end
 
+  @doc false
   @spec build_child_spec(Pool.t(), Finch.name(), map(), pool_idx()) :: Supervisor.child_spec()
-  defp build_child_spec(pool, registry_name, pool_config, pool_idx) do
+  def build_child_spec(pool, registry_name, pool_config, pool_idx) do
     pool_name = Pool.to_name(pool)
     pool_args = {pool, pool_name, registry_name, pool_config, pool_idx}
 
